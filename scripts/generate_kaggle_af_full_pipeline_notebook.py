@@ -61,6 +61,7 @@ def build_notebook() -> nbf.NotebookNode:
             import importlib.util
             import os
             import random
+            import re
             import subprocess
             import sys
             import warnings
@@ -192,6 +193,7 @@ def build_notebook() -> nbf.NotebookNode:
         code(
             """
             AF_LABELS = {"AFIB", "AFL", "AF"}
+            AF_DATASET_DEFAULTS = {"mit_bih_af": "AFIB"}
             LABEL_MAP = {
                 "(AFIB": "AFIB",
                 "AFIB": "AFIB",
@@ -206,6 +208,8 @@ def build_notebook() -> nbf.NotebookNode:
                 "(SBR": "OTHER",
                 "(B": "OTHER",
                 "(T": "OTHER",
+                "AUX": "",
+                "NOTE": "",
             }
 
 
@@ -215,6 +219,14 @@ def build_notebook() -> nbf.NotebookNode:
                     return float(header.fs), int(header.sig_len), int(header.n_sig)
                 except Exception:
                     return 250.0, 0, 1
+
+
+            def infer_signal_length(annotation: wfdb.Annotation | None, sig_len: int) -> int:
+                if sig_len > 0:
+                    return int(sig_len)
+                if annotation is None or len(annotation.sample) == 0:
+                    return 0
+                return int(np.max(annotation.sample))
 
 
             def read_annotation(record_path: str, has_atr: bool, has_qrs: bool, has_ari: bool) -> wfdb.Annotation | None:
@@ -230,17 +242,20 @@ def build_notebook() -> nbf.NotebookNode:
 
             def normalize_label(value: object) -> str:
                 label = str(value).strip().replace("\\x00", "").replace("\\\\x00", "")
+                label = re.sub(r"[^\x20-\x7E]", "", label).strip()
+                label = label.replace("(", "").replace(")", "").strip().upper()
                 if not label:
                     return ""
-                return LABEL_MAP.get(label, LABEL_MAP.get(label.replace("(", ""), label.replace("(", "")))
+                return LABEL_MAP.get(label, label)
 
 
-            def rhythm_segments(annotation: wfdb.Annotation, sig_len: int) -> list[tuple[int, int, str]]:
+            def rhythm_segments(annotation: wfdb.Annotation, sig_len: int, default_label: str = "UNKNOWN") -> list[tuple[int, int, str]]:
                 samples = np.asarray(annotation.sample, dtype=int)
                 aux_notes = [normalize_label(value) for value in getattr(annotation, "aux_note", [])]
-                rhythm_points = [(int(sample), label) for sample, label in zip(samples, aux_notes) if label]
+                valid_labels = set(LABEL_MAP.values()) | {"AFIB", "AFL", "AT", "NORMAL", "OTHER"}
+                rhythm_points = [(int(sample), label) for sample, label in zip(samples, aux_notes) if label in valid_labels]
                 if not rhythm_points:
-                    return [(0, int(sig_len), "UNKNOWN")] if sig_len else []
+                    return [(0, int(sig_len), default_label)] if sig_len else []
                 segments = []
                 for index, (start, label) in enumerate(rhythm_points):
                     end = rhythm_points[index + 1][0] if index + 1 < len(rhythm_points) else int(sig_len or samples[-1])
@@ -320,7 +335,8 @@ def build_notebook() -> nbf.NotebookNode:
         md("## 5. Build or Load Window-Level Dataset"),
         code(
             """
-            FEATURE_CACHE = OUTPUT_DIR / "af_window_features.csv"
+            PREPROCESSING_VERSION = "v2_clean_labels_mit_fallback"
+            FEATURE_CACHE = OUTPUT_DIR / f"af_window_features_{PREPROCESSING_VERSION}.csv"
 
 
             def make_windows_for_segment(start: int, end: int, fs: float, config: Config) -> list[tuple[int, int]]:
@@ -342,9 +358,11 @@ def build_notebook() -> nbf.NotebookNode:
                 record_path = row["record_path"]
                 fs, sig_len, n_sig = read_header(record_path)
                 annotation = read_annotation(record_path, bool(row["has_atr"]), bool(row["has_qrs"]), bool(row["has_ari"]))
+                sig_len = infer_signal_length(annotation, sig_len)
                 if annotation is None or sig_len <= 0:
                     return []
-                segments = rhythm_segments(annotation, sig_len)
+                default_label = AF_DATASET_DEFAULTS.get(str(row["dataset"]), "UNKNOWN")
+                segments = rhythm_segments(annotation, sig_len, default_label=default_label)
                 record_rows = []
                 rng = np.random.default_rng(abs(hash((row["dataset"], row["record"]))) % (2**32))
                 candidate_windows = []
@@ -405,7 +423,21 @@ def build_notebook() -> nbf.NotebookNode:
             NUMERIC_FEATURES = [column for column in windows.columns if column not in META_COLUMNS and pd.api.types.is_numeric_dtype(windows[column])]
 
             clean_windows = windows.copy()
-            clean_windows["rhythm_group"] = clean_windows["rhythm_label"].fillna("OTHER").replace({"": "OTHER", "UNKNOWN": "OTHER"})
+            clinical_label_map = {
+                "NORMAL": "NORMAL",
+                "AFIB": "AFIB",
+                "AF": "AFIB",
+                "AFL": "AFL",
+                "AT": "ATRIAL_TACHYCARDIA",
+                "PAT": "ATRIAL_TACHYCARDIA",
+                "SVTA": "ATRIAL_TACHYCARDIA",
+            }
+            clean_windows["rhythm_group"] = (
+                clean_windows["rhythm_label"]
+                .fillna("OTHER")
+                .replace({"": "OTHER", "UNKNOWN": "OTHER"})
+                .map(lambda value: clinical_label_map.get(str(value).upper(), "OTHER"))
+            )
             counts = clean_windows["rhythm_group"].value_counts()
             keep = counts[counts >= 20].index
             clean_windows["rhythm_group"] = clean_windows["rhythm_group"].where(clean_windows["rhythm_group"].isin(keep), "OTHER_RARE")
@@ -654,7 +686,7 @@ def build_notebook() -> nbf.NotebookNode:
                             print(f"Skipped {name} fold in {dataset_filter or 'pooled'}: {exc}")
                     if fold_rows:
                         rows.append({"scope": dataset_filter or "pooled", "model": name, **pd.DataFrame(fold_rows).mean().to_dict()})
-                return pd.DataFrame(rows).sort_values(["roc_auc", "f1"], ascending=False) if rows else pd.DataFrame()
+                return pd.DataFrame(rows).sort_values(["balanced_accuracy", "f1", "roc_auc"], ascending=False) if rows else pd.DataFrame()
 
 
             def evaluate_multiclass_group_cv(data: pd.DataFrame, dataset_filter: str | None = None) -> pd.DataFrame:
@@ -707,6 +739,8 @@ def build_notebook() -> nbf.NotebookNode:
                     binary_results.append(result)
 
             binary_results = pd.concat([frame for frame in binary_results if not frame.empty], ignore_index=True) if binary_results else pd.DataFrame()
+            if not binary_results.empty:
+                binary_results = binary_results.sort_values(["scope", "balanced_accuracy", "f1", "roc_auc"], ascending=[True, False, False, False])
             display(binary_results)
             binary_results.to_csv(OUTPUT_DIR / "binary_prediction_results.csv", index=False)
             """
@@ -722,6 +756,8 @@ def build_notebook() -> nbf.NotebookNode:
                     classification_results.append(result)
 
             classification_results = pd.concat([frame for frame in classification_results if not frame.empty], ignore_index=True) if classification_results else pd.DataFrame()
+            if not classification_results.empty:
+                classification_results = classification_results.sort_values(["scope", "macro_f1", "balanced_accuracy"], ascending=[True, False, False])
             display(classification_results)
             classification_results.to_csv(OUTPUT_DIR / "rhythm_classification_results.csv", index=False)
             """
@@ -773,17 +809,37 @@ def build_notebook() -> nbf.NotebookNode:
             def fit_best_binary_model(data: pd.DataFrame) -> tuple[Any, pd.DataFrame]:
                 if binary_results.empty:
                     raise ValueError("No binary results available.")
-                best_name = binary_results.iloc[0]["model"]
+                pooled_results = binary_results[binary_results["scope"] == "pooled"].copy()
+                ranking_source = pooled_results if not pooled_results.empty else binary_results.copy()
+                ranking_source = ranking_source.sort_values(["balanced_accuracy", "f1", "roc_auc"], ascending=False)
+                best_name = ranking_source.iloc[0]["model"]
                 models = build_binary_models()
                 model = clone(models[best_name])
                 x_data = data[NUMERIC_FEATURES]
                 y_data = data["binary_af"].astype(int)
                 splitter = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=SEED)
                 train_idx, test_idx = next(splitter.split(x_data, y_data, groups=data["record"].astype(str)))
+                train_groups = data.iloc[train_idx]["record"].astype(str)
+                threshold = 0.5
+                if train_groups.nunique() >= 3:
+                    tune_splitter = GroupShuffleSplit(n_splits=1, test_size=0.25, random_state=SEED)
+                    subtrain_rel, valid_rel = next(tune_splitter.split(x_data.iloc[train_idx], y_data.iloc[train_idx], groups=train_groups))
+                    subtrain_idx = np.asarray(train_idx)[subtrain_rel]
+                    valid_idx = np.asarray(train_idx)[valid_rel]
+                    tune_model = clone(models[best_name]).fit(x_data.iloc[subtrain_idx], y_data.iloc[subtrain_idx])
+                    if hasattr(tune_model, "predict_proba") and y_data.iloc[valid_idx].nunique() == 2:
+                        valid_proba = tune_model.predict_proba(x_data.iloc[valid_idx])[:, 1]
+                        candidates = np.linspace(0.1, 0.9, 81)
+                        scores = [
+                            balanced_accuracy_score(y_data.iloc[valid_idx], (valid_proba >= candidate).astype(int))
+                            for candidate in candidates
+                        ]
+                        threshold = float(candidates[int(np.argmax(scores))])
                 model.fit(x_data.iloc[train_idx], y_data.iloc[train_idx])
-                pred = model.predict(x_data.iloc[test_idx])
                 proba = model.predict_proba(x_data.iloc[test_idx])[:, 1] if hasattr(model, "predict_proba") else None
+                pred = (proba >= threshold).astype(int) if proba is not None else model.predict(x_data.iloc[test_idx])
                 metrics = binary_metrics(y_data.iloc[test_idx], pred, proba)
+                metrics["threshold"] = threshold
                 print("Best model:", best_name, metrics)
                 ConfusionMatrixDisplay.from_predictions(y_data.iloc[test_idx], pred, display_labels=["non-AF", "AF"])
                 plt.title(f"Holdout Confusion Matrix - {best_name}")
