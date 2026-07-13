@@ -344,22 +344,37 @@ def build_notebook() -> nbf.NotebookNode:
                         "rr_rmssd": np.nan,
                         "pnn50": np.nan,
                         "hr_mean": np.nan,
+                        "rr_cv": np.nan,
+                        "rr_range": np.nan,
+                        "rr_mad": np.nan,
+                        "rr_entropy": np.nan,
+                        "irregularity_index": np.nan,
                     }
                 rr = np.diff(beat_samples.astype(float)) / fs
                 rr = rr[(rr > 0.2) & (rr < 3.0)]
                 if len(rr) < 2:
                     return rr_window_features(np.array([], dtype=int), fs)
                 diff_rr = np.diff(rr)
+                rr_hist, _ = np.histogram(rr, bins=10, density=True)
+                rr_hist = rr_hist[rr_hist > 0]
+                rr_mean = float(np.mean(rr))
+                rr_std = float(np.std(rr))
+                rr_rmssd = float(np.sqrt(np.mean(diff_rr**2)))
                 return {
                     "beat_count": float(len(beat_samples)),
-                    "rr_mean": float(np.mean(rr)),
-                    "rr_std": float(np.std(rr)),
+                    "rr_mean": rr_mean,
+                    "rr_std": rr_std,
                     "rr_min": float(np.min(rr)),
                     "rr_max": float(np.max(rr)),
                     "rr_iqr": float(np.percentile(rr, 75) - np.percentile(rr, 25)),
-                    "rr_rmssd": float(np.sqrt(np.mean(diff_rr**2))),
+                    "rr_rmssd": rr_rmssd,
                     "pnn50": float(np.mean(np.abs(diff_rr) > 0.05)),
-                    "hr_mean": float(60.0 / np.mean(rr)),
+                    "hr_mean": float(60.0 / rr_mean),
+                    "rr_cv": float(rr_std / rr_mean) if rr_mean else np.nan,
+                    "rr_range": float(np.max(rr) - np.min(rr)),
+                    "rr_mad": float(np.mean(np.abs(rr - rr_mean))),
+                    "rr_entropy": float(stats.entropy(rr_hist)) if len(rr_hist) else np.nan,
+                    "irregularity_index": float((rr_std + rr_rmssd) / rr_mean) if rr_mean else np.nan,
                 }
 
 
@@ -372,7 +387,7 @@ def build_notebook() -> nbf.NotebookNode:
                     signal = np.empty((0, 0))
                 if signal.size == 0:
                     for channel in range(2):
-                        for stat_name in ["mean", "std", "min", "max", "iqr", "energy", "diff_mean"]:
+                        for stat_name in ["mean", "std", "min", "max", "iqr", "energy", "diff_mean", "abs_mean", "skew", "kurtosis", "zero_crossing_rate"]:
                             features[f"ch{channel}_{stat_name}"] = np.nan
                     return features
                 for channel in range(min(2, signal.shape[1])):
@@ -381,6 +396,8 @@ def build_notebook() -> nbf.NotebookNode:
                     if len(values) == 0:
                         continue
                     diff_values = np.diff(values)
+                    centered = values - np.mean(values)
+                    zero_crossings = np.mean(np.diff(np.signbit(centered)) != 0) if len(centered) > 1 else 0.0
                     features.update(
                         {
                             f"ch{channel}_mean": float(np.mean(values)),
@@ -390,6 +407,10 @@ def build_notebook() -> nbf.NotebookNode:
                             f"ch{channel}_iqr": float(np.percentile(values, 75) - np.percentile(values, 25)),
                             f"ch{channel}_energy": float(np.mean(values**2)),
                             f"ch{channel}_diff_mean": float(np.mean(np.abs(diff_values))) if len(diff_values) else 0.0,
+                            f"ch{channel}_abs_mean": float(np.mean(np.abs(values))),
+                            f"ch{channel}_skew": float(stats.skew(values)) if len(values) > 2 else 0.0,
+                            f"ch{channel}_kurtosis": float(stats.kurtosis(values)) if len(values) > 3 else 0.0,
+                            f"ch{channel}_zero_crossing_rate": float(zero_crossings),
                         }
                     )
                 return features
@@ -398,7 +419,7 @@ def build_notebook() -> nbf.NotebookNode:
         md("## 5. Build or Load Window-Level Dataset"),
         code(
             """
-            PREPROCESSING_VERSION = "v4_best_rhythm_source_prediction_classification"
+            PREPROCESSING_VERSION = "v5_advanced_features_ternary_classification"
             FEATURE_CACHE = OUTPUT_DIR / f"af_window_features_{PREPROCESSING_VERSION}.csv"
 
 
@@ -499,7 +520,7 @@ def build_notebook() -> nbf.NotebookNode:
 
 
             if FEATURE_CACHE.exists():
-                windows = pd.read_csv(FEATURE_CACHE)
+                windows = pd.read_csv(FEATURE_CACHE, dtype={"record": str})
                 print("Loaded cached features:", windows.shape)
             else:
                 rows = []
@@ -510,6 +531,7 @@ def build_notebook() -> nbf.NotebookNode:
                 windows = pd.DataFrame(rows)
                 windows.to_csv(FEATURE_CACHE, index=False)
                 print("Saved:", FEATURE_CACHE)
+            windows["record"] = windows["record"].astype(str)
 
             print(windows.shape)
             if windows.empty:
@@ -523,10 +545,13 @@ def build_notebook() -> nbf.NotebookNode:
         md("## 6. Data Cleaning and Feature Matrix"),
         code(
             """
-            META_COLUMNS = {"dataset", "record", "window_id", "start_sample", "end_sample", "fs", "rhythm_label", "binary_af", "rhythm_source", "beat_source"}
-            NUMERIC_FEATURES = [column for column in windows.columns if column not in META_COLUMNS and pd.api.types.is_numeric_dtype(windows[column])]
-
             clean_windows = windows.copy()
+            clean_windows["record"] = clean_windows["record"].astype(str)
+            clean_windows["record_group"] = clean_windows["dataset"].astype(str) + "__" + clean_windows["record"].astype(str)
+
+            META_COLUMNS = {"dataset", "record", "record_group", "window_id", "start_sample", "end_sample", "fs", "rhythm_label", "binary_af", "rhythm_source", "beat_source", "rhythm_group", "rhythm_group_3"}
+            NUMERIC_FEATURES = [column for column in clean_windows.columns if column not in META_COLUMNS and pd.api.types.is_numeric_dtype(clean_windows[column])]
+
             clinical_label_map = {
                 "NORMAL": "NORMAL",
                 "AFIB": "AFIB",
@@ -545,11 +570,15 @@ def build_notebook() -> nbf.NotebookNode:
             counts = clean_windows["rhythm_group"].value_counts()
             keep = counts[counts >= 20].index
             clean_windows["rhythm_group"] = clean_windows["rhythm_group"].where(clean_windows["rhythm_group"].isin(keep), "OTHER_RARE")
+            clean_windows["rhythm_group_3"] = clean_windows["rhythm_group"].map(
+                lambda value: value if value in {"NORMAL", "AFIB"} else "OTHER_ARRHYTHMIA"
+            )
             clean_windows = clean_windows.dropna(subset=["binary_af"])
 
             print("features:", len(NUMERIC_FEATURES))
             display(clean_windows.groupby(["dataset", "binary_af"]).size().unstack(fill_value=0))
             display(clean_windows["rhythm_group"].value_counts())
+            display(clean_windows["rhythm_group_3"].value_counts())
             """
         ),
         md("## 7. ECG Signal Examples and Exploratory Visuals"),
@@ -650,7 +679,7 @@ def build_notebook() -> nbf.NotebookNode:
             plt.savefig(OUTPUT_DIR / "af_rate_by_dataset.png", dpi=180)
             plt.show()
 
-            rr_features = ["rr_mean", "rr_std", "rr_rmssd", "pnn50", "hr_mean"]
+            rr_features = ["rr_mean", "rr_std", "rr_rmssd", "pnn50", "hr_mean", "rr_cv", "irregularity_index"]
             available_rr = [column for column in rr_features if column in clean_windows.columns]
             if available_rr:
                 melted_rr = clean_windows.melt(
@@ -758,6 +787,29 @@ def build_notebook() -> nbf.NotebookNode:
                             ),
                         ]
                     )
+                    models["LightGBM Tuned"] = Pipeline(
+                        [
+                            ("imputer", SimpleImputer(strategy="median")),
+                            (
+                                "classifier",
+                                LGBMClassifier(
+                                    objective="binary",
+                                    n_estimators=700,
+                                    num_leaves=63,
+                                    min_child_samples=20,
+                                    learning_rate=0.02,
+                                    subsample=0.9,
+                                    colsample_bytree=0.9,
+                                    reg_alpha=0.05,
+                                    reg_lambda=0.2,
+                                    class_weight="balanced",
+                                    random_state=seed,
+                                    n_jobs=-1,
+                                    verbose=-1,
+                                ),
+                            ),
+                        ]
+                    )
                 if CatBoostClassifier is not None:
                     models["CatBoost"] = Pipeline(
                         [
@@ -777,10 +829,32 @@ def build_notebook() -> nbf.NotebookNode:
                             ),
                         ]
                     )
+                    models["CatBoost Tuned"] = Pipeline(
+                        [
+                            ("imputer", SimpleImputer(strategy="median")),
+                            (
+                                "classifier",
+                                CatBoostClassifier(
+                                    iterations=700,
+                                    depth=5,
+                                    learning_rate=0.025,
+                                    l2_leaf_reg=4.0,
+                                    loss_function="Logloss",
+                                    auto_class_weights="Balanced",
+                                    random_seed=seed,
+                                    verbose=False,
+                                    allow_writing_files=False,
+                                ),
+                            ),
+                        ]
+                    )
 
-                voting_estimators = [(name.lower().replace(" ", "_"), clone(model)) for name, model in models.items() if name in {"Random Forest", "Extra Trees", "XGBoost", "LightGBM", "CatBoost"}]
+                voting_names = {"Random Forest", "Extra Trees", "XGBoost", "LightGBM", "LightGBM Tuned", "CatBoost", "CatBoost Tuned"}
+                voting_estimators = [(name.lower().replace(" ", "_"), clone(model)) for name, model in models.items() if name in voting_names]
                 if len(voting_estimators) >= 2:
                     models["Soft Voting Hybrid"] = VotingClassifier(voting_estimators, voting="soft", n_jobs=-1)
+                    weights = [2 if name in {"lightgbm_tuned", "catboost_tuned"} else 1 for name, _ in voting_estimators]
+                    models["Weighted Voting Hybrid"] = VotingClassifier(voting_estimators, voting="soft", weights=weights, n_jobs=-1)
                     models["Stacking Hybrid"] = StackingClassifier(
                         estimators=voting_estimators,
                         final_estimator=LogisticRegression(max_iter=2000, class_weight="balanced", random_state=seed),
@@ -847,6 +921,28 @@ def build_notebook() -> nbf.NotebookNode:
                             ),
                         ]
                     )
+                    models["LightGBM Tuned"] = Pipeline(
+                        [
+                            ("imputer", SimpleImputer(strategy="median")),
+                            (
+                                "classifier",
+                                LGBMClassifier(
+                                    objective="multiclass",
+                                    n_estimators=650,
+                                    num_leaves=63,
+                                    min_child_samples=15,
+                                    learning_rate=0.02,
+                                    subsample=0.9,
+                                    colsample_bytree=0.9,
+                                    reg_lambda=0.2,
+                                    class_weight="balanced",
+                                    random_state=seed,
+                                    n_jobs=-1,
+                                    verbose=-1,
+                                ),
+                            ),
+                        ]
+                    )
                 if CatBoostClassifier is not None:
                     models["CatBoost"] = Pipeline(
                         [
@@ -857,6 +953,25 @@ def build_notebook() -> nbf.NotebookNode:
                                     iterations=400,
                                     depth=4,
                                     learning_rate=0.03,
+                                    loss_function="MultiClass",
+                                    auto_class_weights="Balanced",
+                                    random_seed=seed,
+                                    verbose=False,
+                                    allow_writing_files=False,
+                                ),
+                            ),
+                        ]
+                    )
+                    models["CatBoost Tuned"] = Pipeline(
+                        [
+                            ("imputer", SimpleImputer(strategy="median")),
+                            (
+                                "classifier",
+                                CatBoostClassifier(
+                                    iterations=650,
+                                    depth=5,
+                                    learning_rate=0.025,
+                                    l2_leaf_reg=4.0,
                                     loss_function="MultiClass",
                                     auto_class_weights="Balanced",
                                     random_seed=seed,
@@ -905,7 +1020,7 @@ def build_notebook() -> nbf.NotebookNode:
                     return pd.DataFrame()
                 x_data = working[NUMERIC_FEATURES]
                 y_data = working["binary_af"].astype(int)
-                groups = working["record"].astype(str)
+                groups = working["record_group"].astype(str)
                 splits = safe_group_folds(y_data, groups)
                 if not splits:
                     return pd.DataFrame()
@@ -925,19 +1040,19 @@ def build_notebook() -> nbf.NotebookNode:
                 return pd.DataFrame(rows).sort_values(["balanced_accuracy", "f1", "roc_auc"], ascending=False) if rows else pd.DataFrame()
 
 
-            def evaluate_multiclass_group_cv(data: pd.DataFrame, dataset_filter: str | None = None) -> pd.DataFrame:
+            def evaluate_multiclass_group_cv(data: pd.DataFrame, dataset_filter: str | None = None, target_column: str = "rhythm_group") -> pd.DataFrame:
                 working = data.copy()
                 if dataset_filter is not None:
                     working = working[working["dataset"] == dataset_filter].copy()
-                if working["rhythm_group"].nunique() < 2 or len(working) < 20:
+                if working[target_column].nunique() < 2 or len(working) < 20:
                     return pd.DataFrame()
-                min_count = working["rhythm_group"].value_counts().min()
+                min_count = working[target_column].value_counts().min()
                 if min_count < 2:
                     return pd.DataFrame()
                 encoder = LabelEncoder()
-                y_data = pd.Series(encoder.fit_transform(working["rhythm_group"]), index=working.index)
+                y_data = pd.Series(encoder.fit_transform(working[target_column]), index=working.index)
                 x_data = working[NUMERIC_FEATURES]
-                groups = working["record"].astype(str)
+                groups = working["record_group"].astype(str)
                 splits = safe_group_folds(y_data, groups)
                 if not splits:
                     return pd.DataFrame()
@@ -960,7 +1075,7 @@ def build_notebook() -> nbf.NotebookNode:
                         except Exception as exc:
                             print(f"Skipped {name} fold in {dataset_filter or 'pooled'}: {exc}")
                     if fold_rows:
-                        rows.append({"scope": dataset_filter or "pooled", "model": name, "classes": "|".join(encoder.classes_), **pd.DataFrame(fold_rows).mean().to_dict()})
+                        rows.append({"scope": dataset_filter or "pooled", "target": target_column, "model": name, "classes": "|".join(encoder.classes_), **pd.DataFrame(fold_rows).mean().to_dict()})
                 return pd.DataFrame(rows).sort_values(["macro_f1", "balanced_accuracy"], ascending=False) if rows else pd.DataFrame()
             """
         ),
@@ -996,6 +1111,19 @@ def build_notebook() -> nbf.NotebookNode:
                 classification_results = classification_results.sort_values(["scope", "macro_f1", "balanced_accuracy"], ascending=[True, False, False])
             display(classification_results)
             classification_results.to_csv(OUTPUT_DIR / "rhythm_classification_results.csv", index=False)
+
+            ternary_classification_results = []
+            ternary_classification_results.append(evaluate_multiclass_group_cv(clean_windows, target_column="rhythm_group_3"))
+            for dataset_name in sorted(clean_windows["dataset"].unique()):
+                result = evaluate_multiclass_group_cv(clean_windows, dataset_name, target_column="rhythm_group_3")
+                if not result.empty:
+                    ternary_classification_results.append(result)
+
+            ternary_classification_results = pd.concat([frame for frame in ternary_classification_results if not frame.empty], ignore_index=True) if ternary_classification_results else pd.DataFrame()
+            if not ternary_classification_results.empty:
+                ternary_classification_results = ternary_classification_results.sort_values(["scope", "macro_f1", "balanced_accuracy"], ascending=[True, False, False])
+            display(ternary_classification_results)
+            ternary_classification_results.to_csv(OUTPUT_DIR / "rhythm_classification_3class_results.csv", index=False)
             """
         ),
         md("## 12. Inter-Dataset Validation"),
@@ -1054,8 +1182,8 @@ def build_notebook() -> nbf.NotebookNode:
                 x_data = data[NUMERIC_FEATURES]
                 y_data = data["binary_af"].astype(int)
                 splitter = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=SEED)
-                train_idx, test_idx = next(splitter.split(x_data, y_data, groups=data["record"].astype(str)))
-                train_groups = data.iloc[train_idx]["record"].astype(str)
+                train_idx, test_idx = next(splitter.split(x_data, y_data, groups=data["record_group"].astype(str)))
+                train_groups = data.iloc[train_idx]["record_group"].astype(str)
                 threshold = 0.5
                 if train_groups.nunique() >= 3:
                     tune_splitter = GroupShuffleSplit(n_splits=1, test_size=0.25, random_state=SEED)
@@ -1128,24 +1256,29 @@ def build_notebook() -> nbf.NotebookNode:
             sns.set_theme(style="whitegrid")
 
 
-            def fit_best_multiclass_model(data: pd.DataFrame) -> pd.DataFrame:
-                if classification_results.empty:
+            def fit_best_multiclass_model(
+                data: pd.DataFrame,
+                results: pd.DataFrame,
+                target_column: str,
+                output_prefix: str,
+            ) -> pd.DataFrame:
+                if results.empty:
                     return pd.DataFrame()
-                pooled_results = classification_results[classification_results["scope"] == "pooled"].copy()
-                ranking_source = pooled_results if not pooled_results.empty else classification_results.copy()
+                pooled_results = results[results["scope"] == "pooled"].copy()
+                ranking_source = pooled_results if not pooled_results.empty else results.copy()
                 ranking_source = ranking_source.sort_values(["macro_f1", "balanced_accuracy"], ascending=False)
                 best_name = ranking_source.iloc[0]["model"]
                 models = build_multiclass_models()
                 if best_name not in models:
                     return pd.DataFrame()
-                working = data[data["rhythm_group"].notna()].copy()
-                if working["rhythm_group"].nunique() < 2:
+                working = data[data[target_column].notna()].copy()
+                if working[target_column].nunique() < 2:
                     return pd.DataFrame()
                 encoder = LabelEncoder()
                 x_data = working[NUMERIC_FEATURES]
-                y_data = pd.Series(encoder.fit_transform(working["rhythm_group"]), index=working.index)
+                y_data = pd.Series(encoder.fit_transform(working[target_column]), index=working.index)
                 splitter = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=SEED)
-                train_idx, test_idx = next(splitter.split(x_data, y_data, groups=working["record"].astype(str)))
+                train_idx, test_idx = next(splitter.split(x_data, y_data, groups=working["record_group"].astype(str)))
                 model = clone(models[best_name]).fit(x_data.iloc[train_idx], y_data.iloc[train_idx])
                 pred = np.asarray(model.predict(x_data.iloc[test_idx])).ravel()
                 report = classification_report(
@@ -1157,7 +1290,8 @@ def build_notebook() -> nbf.NotebookNode:
                 )
                 report_frame = pd.DataFrame(report).T.reset_index().rename(columns={"index": "class"})
                 report_frame.insert(0, "model", best_name)
-                report_frame.to_csv(OUTPUT_DIR / "multiclass_holdout_classification_report.csv", index=False)
+                report_frame.insert(1, "target", target_column)
+                report_frame.to_csv(OUTPUT_DIR / f"{output_prefix}_classification_report.csv", index=False)
 
                 ConfusionMatrixDisplay.from_predictions(
                     y_data.iloc[test_idx],
@@ -1165,15 +1299,26 @@ def build_notebook() -> nbf.NotebookNode:
                     display_labels=encoder.classes_,
                     xticks_rotation=35,
                 )
-                plt.title(f"Rhythm Classification Confusion Matrix - {best_name}")
+                plt.title(f"{target_column} Confusion Matrix - {best_name}")
                 plt.tight_layout()
-                plt.savefig(OUTPUT_DIR / "multiclass_holdout_confusion_matrix.png", dpi=180)
+                plt.savefig(OUTPUT_DIR / f"{output_prefix}_confusion_matrix.png", dpi=180)
                 plt.show()
                 display(report_frame)
                 return report_frame
 
 
-            multiclass_holdout_report = fit_best_multiclass_model(clean_windows)
+            multiclass_holdout_report = fit_best_multiclass_model(
+                clean_windows,
+                classification_results,
+                target_column="rhythm_group",
+                output_prefix="multiclass_holdout",
+            )
+            ternary_holdout_report = fit_best_multiclass_model(
+                clean_windows,
+                ternary_classification_results,
+                target_column="rhythm_group_3",
+                output_prefix="ternary_classification_holdout",
+            )
 
             fig, axes = plt.subplots(1, 3, figsize=(16, 4))
             sns.countplot(data=clean_windows, x="dataset", ax=axes[0])
@@ -1207,9 +1352,19 @@ def build_notebook() -> nbf.NotebookNode:
                 plt.savefig(OUTPUT_DIR / "classification_results_plot.png", dpi=180)
                 plt.show()
 
+            if not ternary_classification_results.empty:
+                top_ternary = ternary_classification_results.head(10).copy()
+                plt.figure(figsize=(10, 5))
+                sns.barplot(data=top_ternary, y="model", x="macro_f1", hue="scope")
+                plt.title("Top 3-Class Rhythm Classification Results")
+                plt.tight_layout()
+                plt.savefig(OUTPUT_DIR / "classification_3class_results_plot.png", dpi=180)
+                plt.show()
+
             best_pooled_binary = pd.DataFrame()
             best_dataset_binary = pd.DataFrame()
             best_pooled_classification = pd.DataFrame()
+            best_ternary_classification = pd.DataFrame()
             best_inter_dataset = pd.DataFrame()
             if not binary_results.empty:
                 pooled_binary = binary_results[binary_results["scope"] == "pooled"].copy()
@@ -1222,12 +1377,16 @@ def build_notebook() -> nbf.NotebookNode:
                 pooled_classification = classification_results[classification_results["scope"] == "pooled"].copy()
                 ranking_source = pooled_classification if not pooled_classification.empty else classification_results.copy()
                 best_pooled_classification = ranking_source.sort_values(["macro_f1", "balanced_accuracy"], ascending=False).head(1)
+            if not ternary_classification_results.empty:
+                pooled_ternary = ternary_classification_results[ternary_classification_results["scope"] == "pooled"].copy()
+                ranking_source = pooled_ternary if not pooled_ternary.empty else ternary_classification_results.copy()
+                best_ternary_classification = ranking_source.sort_values(["macro_f1", "balanced_accuracy"], ascending=False).head(1)
             if not inter_dataset_results.empty:
                 best_inter_dataset = inter_dataset_results.sort_values(["balanced_accuracy", "f1", "roc_auc"], ascending=False).head(1)
 
             summary = {
                 "windows": len(clean_windows),
-                "records": clean_windows["record"].nunique(),
+                "records": clean_windows["record_group"].nunique(),
                 "datasets": clean_windows["dataset"].nunique(),
                 "numeric_features": len(NUMERIC_FEATURES),
                 "best_pooled_binary_model": None if best_pooled_binary.empty else best_pooled_binary.iloc[0]["model"],
@@ -1237,6 +1396,9 @@ def build_notebook() -> nbf.NotebookNode:
                 "best_dataset_binary_balanced_accuracy": None if best_dataset_binary.empty else float(best_dataset_binary.iloc[0]["balanced_accuracy"]),
                 "best_rhythm_classification_model": None if best_pooled_classification.empty else best_pooled_classification.iloc[0]["model"],
                 "best_rhythm_classification_macro_f1": None if best_pooled_classification.empty else float(best_pooled_classification.iloc[0]["macro_f1"]),
+                "best_3class_classification_model": None if best_ternary_classification.empty else best_ternary_classification.iloc[0]["model"],
+                "best_3class_classification_macro_f1": None if best_ternary_classification.empty else float(best_ternary_classification.iloc[0]["macro_f1"]),
+                "best_3class_classification_balanced_accuracy": None if best_ternary_classification.empty else float(best_ternary_classification.iloc[0]["balanced_accuracy"]),
                 "best_inter_dataset_train": None if best_inter_dataset.empty else best_inter_dataset.iloc[0]["train_dataset"],
                 "best_inter_dataset_test": None if best_inter_dataset.empty else best_inter_dataset.iloc[0]["test_dataset"],
                 "best_inter_dataset_model": None if best_inter_dataset.empty else best_inter_dataset.iloc[0]["model"],
@@ -1255,6 +1417,7 @@ def build_notebook() -> nbf.NotebookNode:
             - `af_window_features.csv`: extracted window-level dataset.
             - `binary_prediction_results.csv`: AF prediction results.
             - `rhythm_classification_results.csv`: rhythm classification results.
+            - `rhythm_classification_3class_results.csv`: improved 3-class classification results.
             - `inter_dataset_binary_results.csv`: generalization between datasets.
             - `binary_holdout_confusion_matrix.png`: final confusion matrix.
             - `binary_holdout_roc_curve.png`: final binary ROC curve.
@@ -1262,11 +1425,14 @@ def build_notebook() -> nbf.NotebookNode:
             - `binary_feature_importance.png`: top prediction features.
             - `multiclass_holdout_confusion_matrix.png`: final rhythm classification confusion matrix.
             - `multiclass_holdout_classification_report.csv`: per-class classification metrics.
+            - `ternary_classification_holdout_confusion_matrix.png`: final 3-class classification confusion matrix.
+            - `ternary_classification_holdout_classification_report.csv`: final 3-class per-class metrics.
             - `ecg_signal_examples.png`: raw ECG examples from selected rhythms.
             - `rhythm_distribution_by_dataset.png`: class distribution across datasets.
             - `af_rate_by_dataset.png`: AF prevalence across datasets.
             - `rr_feature_boxplots.png`: RR feature differences between AF and non-AF.
             - `feature_correlation_heatmap.png`: feature correlation map.
+            - `classification_3class_results_plot.png`: improved classification comparison plot.
             - `best_binary_model.joblib`: saved best model.
             - `experiment_summary.csv`: concise summary.
 
