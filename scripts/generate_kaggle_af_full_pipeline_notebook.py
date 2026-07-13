@@ -1281,10 +1281,12 @@ def build_notebook() -> nbf.NotebookNode:
                 train_idx, test_idx = next(splitter.split(x_data, y_data, groups=working["record_group"].astype(str)))
                 model = clone(models[best_name]).fit(x_data.iloc[train_idx], y_data.iloc[train_idx])
                 pred = np.asarray(model.predict(x_data.iloc[test_idx])).ravel()
+                all_labels = list(range(len(encoder.classes_)))
                 report = classification_report(
                     y_data.iloc[test_idx],
                     pred,
-                    target_names=encoder.classes_,
+                    labels=all_labels,
+                    target_names=list(encoder.classes_),
                     output_dict=True,
                     zero_division=0,
                 )
@@ -1296,7 +1298,8 @@ def build_notebook() -> nbf.NotebookNode:
                 ConfusionMatrixDisplay.from_predictions(
                     y_data.iloc[test_idx],
                     pred,
-                    display_labels=encoder.classes_,
+                    labels=all_labels,
+                    display_labels=list(encoder.classes_),
                     xticks_rotation=35,
                 )
                 plt.title(f"{target_column} Confusion Matrix - {best_name}")
