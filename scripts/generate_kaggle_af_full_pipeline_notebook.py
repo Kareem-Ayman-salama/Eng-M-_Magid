@@ -90,6 +90,8 @@ def build_notebook() -> nbf.NotebookNode:
             from sklearn.linear_model import LogisticRegression
             from sklearn.metrics import (
                 ConfusionMatrixDisplay,
+                PrecisionRecallDisplay,
+                RocCurveDisplay,
                 accuracy_score,
                 balanced_accuracy_score,
                 classification_report,
@@ -550,7 +552,139 @@ def build_notebook() -> nbf.NotebookNode:
             display(clean_windows["rhythm_group"].value_counts())
             """
         ),
-        md("## 7. Models"),
+        md("## 7. ECG Signal Examples and Exploratory Visuals"),
+        code(
+            """
+            def resolve_record_path(dataset: str, record: str) -> str:
+                record_text = str(record)
+                record_key = record_text.lstrip("0") or "0"
+                record_candidates = records["record"].astype(str)
+                candidate_keys = record_candidates.str.lstrip("0").replace("", "0")
+                match = records[
+                    (records["dataset"] == dataset)
+                    & ((record_candidates == record_text) | (candidate_keys == record_key))
+                ]
+                if match.empty:
+                    raise ValueError(f"Record not found: {dataset}/{record}")
+                return str(match.iloc[0]["record_path"])
+
+
+            def read_signal_window(row: pd.Series) -> tuple[np.ndarray, float]:
+                record_path = resolve_record_path(str(row["dataset"]), str(row["record"]))
+                try:
+                    record = wfdb.rdrecord(
+                        record_path,
+                        sampfrom=int(row["start_sample"]),
+                        sampto=int(row["end_sample"]),
+                        channels=[0],
+                    )
+                    signal = np.asarray(record.p_signal[:, 0], dtype=float)
+                    return signal, float(row["fs"])
+                except Exception:
+                    return np.asarray([], dtype=float), float(row["fs"])
+
+
+            def plot_ecg_examples(data: pd.DataFrame, max_labels: int = 4) -> None:
+                example_labels = [label for label in ["NORMAL", "AFIB", "AFL", "ATRIAL_TACHYCARDIA"] if label in set(data["rhythm_group"])]
+                if len(example_labels) < max_labels:
+                    extra_labels = [label for label in data["rhythm_group"].value_counts().index if label not in example_labels]
+                    example_labels.extend(extra_labels[: max_labels - len(example_labels)])
+                example_labels = example_labels[:max_labels]
+                if not example_labels:
+                    return
+
+                fig, axes = plt.subplots(len(example_labels), 1, figsize=(14, 2.8 * len(example_labels)), sharex=False)
+                if len(example_labels) == 1:
+                    axes = [axes]
+                saved_rows = []
+                for axis, label in zip(axes, example_labels):
+                    row = data[data["rhythm_group"] == label].sample(1, random_state=SEED).iloc[0]
+                    signal, fs = read_signal_window(row)
+                    if signal.size == 0:
+                        axis.set_title(f"{label}: signal unavailable")
+                        continue
+                    seconds = min(12.0, signal.size / fs)
+                    limit = int(seconds * fs)
+                    time_axis = np.arange(limit) / fs
+                    axis.plot(time_axis, signal[:limit], linewidth=0.9)
+                    axis.set_title(f"{label} | {row['dataset']} / {row['record']} | source {row['rhythm_source']}/{row['beat_source']}")
+                    axis.set_ylabel("mV")
+                    axis.grid(alpha=0.25)
+                    saved_rows.append(
+                        {
+                            "label": label,
+                            "dataset": row["dataset"],
+                            "record": row["record"],
+                            "window_id": row["window_id"],
+                            "rhythm_source": row["rhythm_source"],
+                            "beat_source": row["beat_source"],
+                        }
+                    )
+                axes[-1].set_xlabel("Time (seconds)")
+                plt.tight_layout()
+                plt.savefig(OUTPUT_DIR / "ecg_signal_examples.png", dpi=180)
+                plt.show()
+                pd.DataFrame(saved_rows).to_csv(OUTPUT_DIR / "ecg_signal_examples_index.csv", index=False)
+
+
+            plot_ecg_examples(clean_windows)
+
+            label_by_dataset = pd.crosstab(clean_windows["dataset"], clean_windows["rhythm_group"])
+            plt.figure(figsize=(10, 5))
+            label_by_dataset.plot(kind="bar", stacked=True, ax=plt.gca(), colormap="tab20")
+            plt.title("Rhythm Class Distribution by Dataset")
+            plt.ylabel("Windows")
+            plt.xticks(rotation=25)
+            plt.tight_layout()
+            plt.savefig(OUTPUT_DIR / "rhythm_distribution_by_dataset.png", dpi=180)
+            plt.show()
+
+            plt.figure(figsize=(8, 4))
+            af_rate = clean_windows.groupby("dataset", as_index=False)["binary_af"].mean()
+            sns.barplot(data=af_rate, x="dataset", y="binary_af")
+            plt.title("AF Positive Rate by Dataset")
+            plt.ylabel("AF positive rate")
+            plt.xlabel("")
+            plt.xticks(rotation=25)
+            plt.tight_layout()
+            plt.savefig(OUTPUT_DIR / "af_rate_by_dataset.png", dpi=180)
+            plt.show()
+
+            rr_features = ["rr_mean", "rr_std", "rr_rmssd", "pnn50", "hr_mean"]
+            available_rr = [column for column in rr_features if column in clean_windows.columns]
+            if available_rr:
+                melted_rr = clean_windows.melt(
+                    id_vars=["binary_af", "dataset"],
+                    value_vars=available_rr,
+                    var_name="feature",
+                    value_name="value",
+                ).dropna()
+                grid = sns.catplot(
+                    data=melted_rr,
+                    x="binary_af",
+                    y="value",
+                    col="feature",
+                    hue="dataset",
+                    kind="box",
+                    col_wrap=3,
+                    sharey=False,
+                    height=3.2,
+                    aspect=1.2,
+                )
+                grid.fig.suptitle("RR Feature Differences Between non-AF and AF", y=1.03)
+                grid.savefig(OUTPUT_DIR / "rr_feature_boxplots.png", dpi=180)
+                plt.show()
+
+            corr_features = clean_windows[NUMERIC_FEATURES].corr(numeric_only=True).fillna(0.0)
+            plt.figure(figsize=(12, 9))
+            sns.heatmap(corr_features, cmap="vlag", center=0, square=False, cbar_kws={"shrink": 0.8})
+            plt.title("Numeric Feature Correlation Heatmap")
+            plt.tight_layout()
+            plt.savefig(OUTPUT_DIR / "feature_correlation_heatmap.png", dpi=180)
+            plt.show()
+            """
+        ),
+        md("## 8. Models"),
         code(
             """
             def build_binary_models(seed: int = SEED) -> dict[str, Any]:
@@ -735,7 +869,7 @@ def build_notebook() -> nbf.NotebookNode:
                 return models
             """
         ),
-        md("## 8. Group-Aware Evaluation Helpers"),
+        md("## 9. Group-Aware Evaluation Helpers"),
         code(
             """
             def safe_group_folds(y: pd.Series, groups: pd.Series, max_folds: int = 5) -> list[tuple[np.ndarray, np.ndarray]]:
@@ -830,7 +964,7 @@ def build_notebook() -> nbf.NotebookNode:
                 return pd.DataFrame(rows).sort_values(["macro_f1", "balanced_accuracy"], ascending=False) if rows else pd.DataFrame()
             """
         ),
-        md("## 9. Run Binary Prediction Experiments"),
+        md("## 10. Run Binary Prediction Experiments"),
         code(
             """
             binary_results = []
@@ -847,7 +981,7 @@ def build_notebook() -> nbf.NotebookNode:
             binary_results.to_csv(OUTPUT_DIR / "binary_prediction_results.csv", index=False)
             """
         ),
-        md("## 10. Run Rhythm Classification Experiments"),
+        md("## 11. Run Rhythm Classification Experiments"),
         code(
             """
             classification_results = []
@@ -864,7 +998,7 @@ def build_notebook() -> nbf.NotebookNode:
             classification_results.to_csv(OUTPUT_DIR / "rhythm_classification_results.csv", index=False)
             """
         ),
-        md("## 11. Inter-Dataset Validation"),
+        md("## 12. Inter-Dataset Validation"),
         code(
             """
             def evaluate_inter_dataset_binary(data: pd.DataFrame) -> pd.DataFrame:
@@ -905,7 +1039,7 @@ def build_notebook() -> nbf.NotebookNode:
             inter_dataset_results.to_csv(OUTPUT_DIR / "inter_dataset_binary_results.csv", index=False)
             """
         ),
-        md("## 12. Final Model, Confusion Matrix, and Feature Importance"),
+        md("## 13. Final Binary Prediction Evaluation"),
         code(
             """
             def fit_best_binary_model(data: pd.DataFrame) -> tuple[Any, pd.DataFrame]:
@@ -949,8 +1083,36 @@ def build_notebook() -> nbf.NotebookNode:
                 plt.savefig(OUTPUT_DIR / "binary_holdout_confusion_matrix.png", dpi=180)
                 plt.show()
 
+                if proba is not None and y_data.iloc[test_idx].nunique() == 2:
+                    RocCurveDisplay.from_predictions(y_data.iloc[test_idx], proba)
+                    plt.title(f"Holdout ROC Curve - {best_name}")
+                    plt.tight_layout()
+                    plt.savefig(OUTPUT_DIR / "binary_holdout_roc_curve.png", dpi=180)
+                    plt.show()
+
+                    PrecisionRecallDisplay.from_predictions(y_data.iloc[test_idx], proba)
+                    plt.title(f"Holdout Precision-Recall Curve - {best_name}")
+                    plt.tight_layout()
+                    plt.savefig(OUTPUT_DIR / "binary_holdout_precision_recall_curve.png", dpi=180)
+                    plt.show()
+
                 fitted_full = clone(models[best_name]).fit(x_data, y_data)
                 joblib.dump(fitted_full, OUTPUT_DIR / "best_binary_model.joblib")
+                classifier = fitted_full.named_steps.get("classifier") if hasattr(fitted_full, "named_steps") else fitted_full
+                if hasattr(classifier, "feature_importances_"):
+                    importance = pd.DataFrame(
+                        {
+                            "feature": NUMERIC_FEATURES,
+                            "importance": classifier.feature_importances_,
+                        }
+                    ).sort_values("importance", ascending=False)
+                    importance.to_csv(OUTPUT_DIR / "binary_feature_importance.csv", index=False)
+                    plt.figure(figsize=(10, 6))
+                    sns.barplot(data=importance.head(15), y="feature", x="importance")
+                    plt.title(f"Top Binary Prediction Features - {best_name}")
+                    plt.tight_layout()
+                    plt.savefig(OUTPUT_DIR / "binary_feature_importance.png", dpi=180)
+                    plt.show()
                 return fitted_full, pd.DataFrame([{"model": best_name, **metrics}])
 
 
@@ -960,10 +1122,58 @@ def build_notebook() -> nbf.NotebookNode:
                 holdout_metrics.to_csv(OUTPUT_DIR / "binary_holdout_metrics.csv", index=False)
             """
         ),
-        md("## 13. Plots and Summary"),
+        md("## 14. Final Rhythm Classification Evaluation and Summary"),
         code(
             """
             sns.set_theme(style="whitegrid")
+
+
+            def fit_best_multiclass_model(data: pd.DataFrame) -> pd.DataFrame:
+                if classification_results.empty:
+                    return pd.DataFrame()
+                pooled_results = classification_results[classification_results["scope"] == "pooled"].copy()
+                ranking_source = pooled_results if not pooled_results.empty else classification_results.copy()
+                ranking_source = ranking_source.sort_values(["macro_f1", "balanced_accuracy"], ascending=False)
+                best_name = ranking_source.iloc[0]["model"]
+                models = build_multiclass_models()
+                if best_name not in models:
+                    return pd.DataFrame()
+                working = data[data["rhythm_group"].notna()].copy()
+                if working["rhythm_group"].nunique() < 2:
+                    return pd.DataFrame()
+                encoder = LabelEncoder()
+                x_data = working[NUMERIC_FEATURES]
+                y_data = pd.Series(encoder.fit_transform(working["rhythm_group"]), index=working.index)
+                splitter = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=SEED)
+                train_idx, test_idx = next(splitter.split(x_data, y_data, groups=working["record"].astype(str)))
+                model = clone(models[best_name]).fit(x_data.iloc[train_idx], y_data.iloc[train_idx])
+                pred = np.asarray(model.predict(x_data.iloc[test_idx])).ravel()
+                report = classification_report(
+                    y_data.iloc[test_idx],
+                    pred,
+                    target_names=encoder.classes_,
+                    output_dict=True,
+                    zero_division=0,
+                )
+                report_frame = pd.DataFrame(report).T.reset_index().rename(columns={"index": "class"})
+                report_frame.insert(0, "model", best_name)
+                report_frame.to_csv(OUTPUT_DIR / "multiclass_holdout_classification_report.csv", index=False)
+
+                ConfusionMatrixDisplay.from_predictions(
+                    y_data.iloc[test_idx],
+                    pred,
+                    display_labels=encoder.classes_,
+                    xticks_rotation=35,
+                )
+                plt.title(f"Rhythm Classification Confusion Matrix - {best_name}")
+                plt.tight_layout()
+                plt.savefig(OUTPUT_DIR / "multiclass_holdout_confusion_matrix.png", dpi=180)
+                plt.show()
+                display(report_frame)
+                return report_frame
+
+
+            multiclass_holdout_report = fit_best_multiclass_model(clean_windows)
 
             fig, axes = plt.subplots(1, 3, figsize=(16, 4))
             sns.countplot(data=clean_windows, x="dataset", ax=axes[0])
@@ -997,15 +1207,40 @@ def build_notebook() -> nbf.NotebookNode:
                 plt.savefig(OUTPUT_DIR / "classification_results_plot.png", dpi=180)
                 plt.show()
 
+            best_pooled_binary = pd.DataFrame()
+            best_dataset_binary = pd.DataFrame()
+            best_pooled_classification = pd.DataFrame()
+            best_inter_dataset = pd.DataFrame()
+            if not binary_results.empty:
+                pooled_binary = binary_results[binary_results["scope"] == "pooled"].copy()
+                if not pooled_binary.empty:
+                    best_pooled_binary = pooled_binary.sort_values(["balanced_accuracy", "f1", "roc_auc"], ascending=False).head(1)
+                dataset_binary = binary_results[binary_results["scope"] != "pooled"].copy()
+                if not dataset_binary.empty:
+                    best_dataset_binary = dataset_binary.sort_values(["balanced_accuracy", "f1", "roc_auc"], ascending=False).head(1)
+            if not classification_results.empty:
+                pooled_classification = classification_results[classification_results["scope"] == "pooled"].copy()
+                ranking_source = pooled_classification if not pooled_classification.empty else classification_results.copy()
+                best_pooled_classification = ranking_source.sort_values(["macro_f1", "balanced_accuracy"], ascending=False).head(1)
+            if not inter_dataset_results.empty:
+                best_inter_dataset = inter_dataset_results.sort_values(["balanced_accuracy", "f1", "roc_auc"], ascending=False).head(1)
+
             summary = {
                 "windows": len(clean_windows),
                 "records": clean_windows["record"].nunique(),
                 "datasets": clean_windows["dataset"].nunique(),
                 "numeric_features": len(NUMERIC_FEATURES),
-                "best_binary_model": None if binary_results.empty else binary_results.iloc[0]["model"],
-                "best_binary_balanced_accuracy": None if binary_results.empty else float(binary_results.iloc[0]["balanced_accuracy"]),
-                "best_classification_model": None if classification_results.empty else classification_results.iloc[0]["model"],
-                "best_classification_macro_f1": None if classification_results.empty else float(classification_results.iloc[0]["macro_f1"]),
+                "best_pooled_binary_model": None if best_pooled_binary.empty else best_pooled_binary.iloc[0]["model"],
+                "best_pooled_binary_balanced_accuracy": None if best_pooled_binary.empty else float(best_pooled_binary.iloc[0]["balanced_accuracy"]),
+                "best_dataset_binary_scope": None if best_dataset_binary.empty else best_dataset_binary.iloc[0]["scope"],
+                "best_dataset_binary_model": None if best_dataset_binary.empty else best_dataset_binary.iloc[0]["model"],
+                "best_dataset_binary_balanced_accuracy": None if best_dataset_binary.empty else float(best_dataset_binary.iloc[0]["balanced_accuracy"]),
+                "best_rhythm_classification_model": None if best_pooled_classification.empty else best_pooled_classification.iloc[0]["model"],
+                "best_rhythm_classification_macro_f1": None if best_pooled_classification.empty else float(best_pooled_classification.iloc[0]["macro_f1"]),
+                "best_inter_dataset_train": None if best_inter_dataset.empty else best_inter_dataset.iloc[0]["train_dataset"],
+                "best_inter_dataset_test": None if best_inter_dataset.empty else best_inter_dataset.iloc[0]["test_dataset"],
+                "best_inter_dataset_model": None if best_inter_dataset.empty else best_inter_dataset.iloc[0]["model"],
+                "best_inter_dataset_balanced_accuracy": None if best_inter_dataset.empty else float(best_inter_dataset.iloc[0]["balanced_accuracy"]),
             }
             pd.DataFrame([summary]).to_csv(OUTPUT_DIR / "experiment_summary.csv", index=False)
             summary
@@ -1013,7 +1248,7 @@ def build_notebook() -> nbf.NotebookNode:
         ),
         md(
             """
-            ## 14. What To Report
+            ## 15. What To Report
 
             After running the notebook once, use these files from `/kaggle/working/af_full_pipeline_outputs`:
 
@@ -1022,6 +1257,16 @@ def build_notebook() -> nbf.NotebookNode:
             - `rhythm_classification_results.csv`: rhythm classification results.
             - `inter_dataset_binary_results.csv`: generalization between datasets.
             - `binary_holdout_confusion_matrix.png`: final confusion matrix.
+            - `binary_holdout_roc_curve.png`: final binary ROC curve.
+            - `binary_holdout_precision_recall_curve.png`: final binary precision-recall curve.
+            - `binary_feature_importance.png`: top prediction features.
+            - `multiclass_holdout_confusion_matrix.png`: final rhythm classification confusion matrix.
+            - `multiclass_holdout_classification_report.csv`: per-class classification metrics.
+            - `ecg_signal_examples.png`: raw ECG examples from selected rhythms.
+            - `rhythm_distribution_by_dataset.png`: class distribution across datasets.
+            - `af_rate_by_dataset.png`: AF prevalence across datasets.
+            - `rr_feature_boxplots.png`: RR feature differences between AF and non-AF.
+            - `feature_correlation_heatmap.png`: feature correlation map.
             - `best_binary_model.joblib`: saved best model.
             - `experiment_summary.csv`: concise summary.
 

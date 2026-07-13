@@ -59,6 +59,16 @@ Rhythm classification:
 - `rhythm_classification_results.csv`: نتائج multiclass classification.
 - `inter_dataset_binary_results.csv`: تدريب على dataset واختبار على dataset أخرى.
 - `binary_holdout_confusion_matrix.png`: confusion matrix لأفضل موديل binary.
+- `binary_holdout_roc_curve.png`: ROC curve لأفضل موديل prediction.
+- `binary_holdout_precision_recall_curve.png`: Precision-Recall curve لأفضل موديل prediction.
+- `binary_feature_importance.png`: أهم features في prediction.
+- `multiclass_holdout_confusion_matrix.png`: confusion matrix للـ rhythm classification.
+- `multiclass_holdout_classification_report.csv`: precision/recall/F1 لكل rhythm class.
+- `ecg_signal_examples.png`: أمثلة ECG حقيقية من الـ rhythms المتاحة.
+- `rhythm_distribution_by_dataset.png`: توزيع rhythm classes على كل dataset.
+- `af_rate_by_dataset.png`: نسبة AF في كل dataset.
+- `rr_feature_boxplots.png`: اختلاف RR features بين AF وnon-AF.
+- `feature_correlation_heatmap.png`: correlation heatmap للـ features.
 - `dataset_summary_plots.png`: توزيع البيانات والـ labels.
 - `binary_results_plot.png`: أفضل نتائج prediction.
 - `classification_results_plot.png`: أفضل نتائج classification.
