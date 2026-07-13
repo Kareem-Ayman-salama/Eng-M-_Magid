@@ -54,7 +54,7 @@ Rhythm classification:
 أهم الملفات:
 
 - `record_inventory.csv`: حصر السجلات والـ annotation files.
-- `af_window_features_v3_split_rhythm_beat_annotations.csv`: features المستخرجة لكل window بعد فصل rhythm annotations عن beat/QRS annotations.
+- `af_window_features_v4_best_rhythm_source_prediction_classification.csv`: features المستخرجة لكل window بعد اختيار أفضل مصدر rhythm وفصل prediction عن classification.
 - `binary_prediction_results.csv`: نتائج prediction للـ AF.
 - `rhythm_classification_results.csv`: نتائج multiclass classification.
 - `inter_dataset_binary_results.csv`: تدريب على dataset واختبار على dataset أخرى.
@@ -72,5 +72,6 @@ Rhythm classification:
 - النسخة الحالية تنظف control characters من labels، وتجمع rhythm labels في مجموعات طبية أوضح: `NORMAL`, `AFIB`, `AFL`, `ATRIAL_TACHYCARDIA`, `OTHER`.
 - النسخة الحالية تضيف fallback لـ MIT-BIH AF حتى تدخل في التجربة عندما لا تكون rhythm segments صريحة في الـ annotations.
 - النسخة الحالية تفصل rhythm annotations عن beat/QRS annotations حتى لا تظهر features فاضية عند قواعد WFDB التي تستخدم ملفات annotation مختلفة.
+- النسخة الحالية تختار أفضل annotation source للـ rhythm labels لكل record، ثم تستخدم beat/QRS source منفصل لاستخراج RR features.
 - يمكن تقليل زمن التشغيل بتعديل `max_windows_per_record` أو `max_records_per_dataset` داخل خلية Configuration.
 - المقارنة البحثية الأقوى هنا ليست accuracy فقط، بل inter-dataset validation لأنها تثبت أن الموديل لا يحفظ dataset واحدة فقط.

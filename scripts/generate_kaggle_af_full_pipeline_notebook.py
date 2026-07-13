@@ -194,6 +194,7 @@ def build_notebook() -> nbf.NotebookNode:
             """
             AF_LABELS = {"AFIB", "AFL", "AF"}
             AF_DATASET_DEFAULTS = {"mit_bih_af": "AFIB"}
+            CLINICAL_RHYTHM_LABELS = {"AFIB", "AFL", "AT", "PAT", "SVTA", "NOD", "NORMAL"}
             LABEL_MAP = {
                 "(AFIB": "AFIB",
                 "AFIB": "AFIB",
@@ -203,6 +204,12 @@ def build_notebook() -> nbf.NotebookNode:
                 "AF": "AFIB",
                 "(AT": "AT",
                 "AT": "AT",
+                "(PAT": "PAT",
+                "PAT": "PAT",
+                "(SVTA": "SVTA",
+                "SVTA": "SVTA",
+                "(NOD": "NOD",
+                "NOD": "NOD",
                 "(N": "NORMAL",
                 "N": "NORMAL",
                 "(SBR": "OTHER",
@@ -229,22 +236,52 @@ def build_notebook() -> nbf.NotebookNode:
                 return int(np.max(annotation.sample))
 
 
-            def read_annotation(record_path: str, extensions: list[tuple[str, bool]]) -> wfdb.Annotation | None:
+            def read_annotation_sources(record_path: str, extensions: list[tuple[str, bool]]) -> list[tuple[str, wfdb.Annotation]]:
+                annotations: list[tuple[str, wfdb.Annotation]] = []
                 for extension, enabled in extensions:
                     if not enabled:
                         continue
                     try:
-                        return wfdb.rdann(record_path, extension)
+                        annotations.append((extension, wfdb.rdann(record_path, extension)))
                     except Exception:
                         continue
-                return None
+                return annotations
 
 
-            def read_rhythm_annotation(record_path: str, has_atr: bool, has_qrs: bool, has_ari: bool) -> wfdb.Annotation | None:
-                return read_annotation(record_path, [("atr", has_atr), ("ari", has_ari), ("qrs", has_qrs)])
+            def read_annotation(record_path: str, extensions: list[tuple[str, bool]]) -> tuple[str, wfdb.Annotation] | None:
+                annotations = read_annotation_sources(record_path, extensions)
+                return annotations[0] if annotations else None
 
 
-            def read_beat_annotation(record_path: str, has_atr: bool, has_qrs: bool, has_ari: bool) -> wfdb.Annotation | None:
+            def annotation_label_counts(annotation: wfdb.Annotation) -> pd.Series:
+                labels = [normalize_label(value) for value in getattr(annotation, "aux_note", [])]
+                labels = [label for label in labels if label]
+                return pd.Series(labels, dtype="object").value_counts()
+
+
+            def rhythm_source_score(annotation: wfdb.Annotation) -> float:
+                counts = annotation_label_counts(annotation)
+                if counts.empty:
+                    return 0.0
+                clinical_count = float(counts[counts.index.isin(CLINICAL_RHYTHM_LABELS)].sum())
+                af_count = float(counts[counts.index.isin({"AFIB", "AFL", "AT", "PAT", "SVTA", "NOD"})].sum())
+                normal_count = float(counts[counts.index == "NORMAL"].sum())
+                return clinical_count + (2.0 * af_count) + (0.25 * normal_count)
+
+
+            def read_rhythm_annotation(record_path: str, has_atr: bool, has_qrs: bool, has_ari: bool) -> tuple[str, wfdb.Annotation] | None:
+                sources = read_annotation_sources(record_path, [("atr", has_atr), ("ari", has_ari), ("qrs", has_qrs)])
+                if not sources:
+                    return None
+                scored_sources = [(source, annotation, rhythm_source_score(annotation)) for source, annotation in sources]
+                scored_sources = [item for item in scored_sources if item[2] > 0]
+                if not scored_sources:
+                    return None
+                best_source, best_annotation, _ = max(scored_sources, key=lambda item: item[2])
+                return best_source, best_annotation
+
+
+            def read_beat_annotation(record_path: str, has_atr: bool, has_qrs: bool, has_ari: bool) -> tuple[str, wfdb.Annotation] | None:
                 return read_annotation(record_path, [("qrs", has_qrs), ("atr", has_atr), ("ari", has_ari)])
 
 
@@ -260,8 +297,7 @@ def build_notebook() -> nbf.NotebookNode:
             def rhythm_segments(annotation: wfdb.Annotation, sig_len: int, default_label: str = "UNKNOWN") -> list[tuple[int, int, str]]:
                 samples = np.asarray(annotation.sample, dtype=int)
                 aux_notes = [normalize_label(value) for value in getattr(annotation, "aux_note", [])]
-                valid_labels = set(LABEL_MAP.values()) | {"AFIB", "AFL", "AT", "NORMAL", "OTHER"}
-                rhythm_points = [(int(sample), label) for sample, label in zip(samples, aux_notes) if label in valid_labels]
+                rhythm_points = [(int(sample), label) for sample, label in zip(samples, aux_notes) if label in CLINICAL_RHYTHM_LABELS]
                 if not rhythm_points:
                     return [(0, int(sig_len), default_label)] if sig_len else []
                 segments = []
@@ -360,7 +396,7 @@ def build_notebook() -> nbf.NotebookNode:
         md("## 5. Build or Load Window-Level Dataset"),
         code(
             """
-            PREPROCESSING_VERSION = "v3_split_rhythm_beat_annotations"
+            PREPROCESSING_VERSION = "v4_best_rhythm_source_prediction_classification"
             FEATURE_CACHE = OUTPUT_DIR / f"af_window_features_{PREPROCESSING_VERSION}.csv"
 
 
@@ -382,8 +418,12 @@ def build_notebook() -> nbf.NotebookNode:
             def extract_features_for_record(row: pd.Series, config: Config) -> list[dict[str, Any]]:
                 record_path = row["record_path"]
                 fs, sig_len, n_sig = read_header(record_path)
-                rhythm_annotation = read_rhythm_annotation(record_path, bool(row["has_atr"]), bool(row["has_qrs"]), bool(row["has_ari"]))
-                beat_annotation = read_beat_annotation(record_path, bool(row["has_atr"]), bool(row["has_qrs"]), bool(row["has_ari"]))
+                rhythm_source = read_rhythm_annotation(record_path, bool(row["has_atr"]), bool(row["has_qrs"]), bool(row["has_ari"]))
+                beat_source = read_beat_annotation(record_path, bool(row["has_atr"]), bool(row["has_qrs"]), bool(row["has_ari"]))
+                rhythm_annotation = rhythm_source[1] if rhythm_source is not None else None
+                rhythm_source_name = rhythm_source[0] if rhythm_source is not None else "fallback"
+                beat_annotation = beat_source[1] if beat_source is not None else None
+                beat_source_name = beat_source[0] if beat_source is not None else "none"
                 sig_len = infer_signal_length(beat_annotation or rhythm_annotation, sig_len)
                 if beat_annotation is None or sig_len <= 0:
                     return []
@@ -419,6 +459,8 @@ def build_notebook() -> nbf.NotebookNode:
                             "fs": float(fs),
                             "rhythm_label": rhythm_label,
                             "binary_af": binary_af,
+                            "rhythm_source": rhythm_source_name,
+                            "beat_source": beat_source_name,
                         }
                     )
                     record_rows.append(features)
@@ -446,6 +488,8 @@ def build_notebook() -> nbf.NotebookNode:
                                 "fs": float(fs),
                                 "rhythm_label": rhythm_label,
                                 "binary_af": int(rhythm_label in {"AFIB", "AFL", "AF"}),
+                                "rhythm_source": rhythm_source_name,
+                                "beat_source": beat_source_name,
                             }
                         )
                         record_rows.append(features)
@@ -470,13 +514,14 @@ def build_notebook() -> nbf.NotebookNode:
                 raise ValueError("No windows were extracted. Check WFDB annotation extensions and Kaggle input paths.")
             display(windows.head())
             display(windows.groupby("dataset").agg(windows=("window_id", "count"), records=("record", "nunique"), af_rate=("binary_af", "mean")))
+            display(windows.groupby(["dataset", "rhythm_source", "beat_source"]).size().reset_index(name="windows").sort_values(["dataset", "windows"], ascending=[True, False]))
             display(windows["rhythm_label"].value_counts().head(20))
             """
         ),
         md("## 6. Data Cleaning and Feature Matrix"),
         code(
             """
-            META_COLUMNS = {"dataset", "record", "window_id", "start_sample", "end_sample", "fs", "rhythm_label", "binary_af"}
+            META_COLUMNS = {"dataset", "record", "window_id", "start_sample", "end_sample", "fs", "rhythm_label", "binary_af", "rhythm_source", "beat_source"}
             NUMERIC_FEATURES = [column for column in windows.columns if column not in META_COLUMNS and pd.api.types.is_numeric_dtype(windows[column])]
 
             clean_windows = windows.copy()
