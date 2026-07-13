@@ -229,8 +229,8 @@ def build_notebook() -> nbf.NotebookNode:
                 return int(np.max(annotation.sample))
 
 
-            def read_annotation(record_path: str, has_atr: bool, has_qrs: bool, has_ari: bool) -> wfdb.Annotation | None:
-                for extension, enabled in [("atr", has_atr), ("qrs", has_qrs), ("ari", has_ari)]:
+            def read_annotation(record_path: str, extensions: list[tuple[str, bool]]) -> wfdb.Annotation | None:
+                for extension, enabled in extensions:
                     if not enabled:
                         continue
                     try:
@@ -238,6 +238,14 @@ def build_notebook() -> nbf.NotebookNode:
                     except Exception:
                         continue
                 return None
+
+
+            def read_rhythm_annotation(record_path: str, has_atr: bool, has_qrs: bool, has_ari: bool) -> wfdb.Annotation | None:
+                return read_annotation(record_path, [("atr", has_atr), ("ari", has_ari), ("qrs", has_qrs)])
+
+
+            def read_beat_annotation(record_path: str, has_atr: bool, has_qrs: bool, has_ari: bool) -> wfdb.Annotation | None:
+                return read_annotation(record_path, [("qrs", has_qrs), ("atr", has_atr), ("ari", has_ari)])
 
 
             def normalize_label(value: object) -> str:
@@ -267,6 +275,23 @@ def build_notebook() -> nbf.NotebookNode:
             def beat_samples_in_window(annotation: wfdb.Annotation, start: int, end: int) -> np.ndarray:
                 samples = np.asarray(annotation.sample, dtype=int)
                 return samples[(samples >= start) & (samples < end)]
+
+
+            def beat_based_windows(annotation: wfdb.Annotation, fs: float, sig_len: int, config: Config, label: str) -> list[tuple[int, int, str]]:
+                samples = np.asarray(annotation.sample, dtype=int)
+                if len(samples) < config.min_beats_per_window:
+                    return []
+                window = int(config.window_seconds * fs)
+                stride = int(config.stride_seconds * fs)
+                start = max(0, int(samples[0]) - window // 2)
+                end_limit = int(sig_len or samples[-1])
+                windows = []
+                while start + window <= end_limit:
+                    windows.append((start, start + window, label))
+                    start += stride
+                if not windows:
+                    windows.append((max(0, int(samples[0]) - window // 2), min(end_limit, int(samples[-1]) + window // 2), label))
+                return windows
 
 
             def rr_window_features(beat_samples: np.ndarray, fs: float) -> dict[str, float]:
@@ -335,7 +360,7 @@ def build_notebook() -> nbf.NotebookNode:
         md("## 5. Build or Load Window-Level Dataset"),
         code(
             """
-            PREPROCESSING_VERSION = "v2_clean_labels_mit_fallback"
+            PREPROCESSING_VERSION = "v3_split_rhythm_beat_annotations"
             FEATURE_CACHE = OUTPUT_DIR / f"af_window_features_{PREPROCESSING_VERSION}.csv"
 
 
@@ -357,23 +382,26 @@ def build_notebook() -> nbf.NotebookNode:
             def extract_features_for_record(row: pd.Series, config: Config) -> list[dict[str, Any]]:
                 record_path = row["record_path"]
                 fs, sig_len, n_sig = read_header(record_path)
-                annotation = read_annotation(record_path, bool(row["has_atr"]), bool(row["has_qrs"]), bool(row["has_ari"]))
-                sig_len = infer_signal_length(annotation, sig_len)
-                if annotation is None or sig_len <= 0:
+                rhythm_annotation = read_rhythm_annotation(record_path, bool(row["has_atr"]), bool(row["has_qrs"]), bool(row["has_ari"]))
+                beat_annotation = read_beat_annotation(record_path, bool(row["has_atr"]), bool(row["has_qrs"]), bool(row["has_ari"]))
+                sig_len = infer_signal_length(beat_annotation or rhythm_annotation, sig_len)
+                if beat_annotation is None or sig_len <= 0:
                     return []
                 default_label = AF_DATASET_DEFAULTS.get(str(row["dataset"]), "UNKNOWN")
-                segments = rhythm_segments(annotation, sig_len, default_label=default_label)
+                segments = rhythm_segments(rhythm_annotation or beat_annotation, sig_len, default_label=default_label)
                 record_rows = []
                 rng = np.random.default_rng(abs(hash((row["dataset"], row["record"]))) % (2**32))
                 candidate_windows = []
                 for start, end, label in segments:
                     for window_start, window_end in make_windows_for_segment(start, end, fs, config):
                         candidate_windows.append((window_start, window_end, label))
+                if not candidate_windows:
+                    candidate_windows = beat_based_windows(beat_annotation, fs, sig_len, config, default_label)
                 if len(candidate_windows) > config.max_windows_per_record:
                     indices = rng.choice(len(candidate_windows), size=config.max_windows_per_record, replace=False)
                     candidate_windows = [candidate_windows[index] for index in sorted(indices)]
                 for window_index, (start, end, label) in enumerate(candidate_windows):
-                    beats = beat_samples_in_window(annotation, start, end)
+                    beats = beat_samples_in_window(beat_annotation, start, end)
                     if len(beats) < config.min_beats_per_window:
                         continue
                     features = rr_window_features(beats, fs)
@@ -394,6 +422,33 @@ def build_notebook() -> nbf.NotebookNode:
                         }
                     )
                     record_rows.append(features)
+                if not record_rows and candidate_windows:
+                    fallback_windows = beat_based_windows(beat_annotation, fs, sig_len, config, default_label)
+                    if len(fallback_windows) > config.max_windows_per_record:
+                        indices = rng.choice(len(fallback_windows), size=config.max_windows_per_record, replace=False)
+                        fallback_windows = [fallback_windows[index] for index in sorted(indices)]
+                    for window_index, (start, end, label) in enumerate(fallback_windows):
+                        beats = beat_samples_in_window(beat_annotation, start, end)
+                        if len(beats) < config.min_beats_per_window:
+                            continue
+                        features = rr_window_features(beats, fs)
+                        features.update(signal_window_features(record_path, start, end, n_sig))
+                        rhythm_label = normalize_label(label) or "OTHER"
+                        if rhythm_label == "UNKNOWN":
+                            rhythm_label = "OTHER"
+                        features.update(
+                            {
+                                "dataset": row["dataset"],
+                                "record": row["record"],
+                                "window_id": f"{row['dataset']}__{row['record']}__fallback__{window_index}",
+                                "start_sample": int(start),
+                                "end_sample": int(end),
+                                "fs": float(fs),
+                                "rhythm_label": rhythm_label,
+                                "binary_af": int(rhythm_label in {"AFIB", "AFL", "AF"}),
+                            }
+                        )
+                        record_rows.append(features)
                 return record_rows
 
 
@@ -411,6 +466,8 @@ def build_notebook() -> nbf.NotebookNode:
                 print("Saved:", FEATURE_CACHE)
 
             print(windows.shape)
+            if windows.empty:
+                raise ValueError("No windows were extracted. Check WFDB annotation extensions and Kaggle input paths.")
             display(windows.head())
             display(windows.groupby("dataset").agg(windows=("window_id", "count"), records=("record", "nunique"), af_rate=("binary_af", "mean")))
             display(windows["rhythm_label"].value_counts().head(20))
