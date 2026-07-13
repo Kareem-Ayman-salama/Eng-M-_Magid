@@ -1,0 +1,2 @@
+model,n_estimators,max_depth,learning_rate,subsample,colsample_bytree,min_child_weight,gamma,reg_lambda,reg_alpha
+Published-Protocol PSO-XGBoost,691,4,0.06909733251262017,0.8235307617217673,0.8344926760862714,0.5,1.104541040753265,0.2,1.0650734835184457

@@ -1,0 +1,4 @@
+model,accuracy,balanced_accuracy,f1,source
+Current CatBoost Deep,0.8451327433628318,0.841407867494824,0.825,our strict CV threshold result
+Published-Protocol PSO-XGBoost,0.8407079646017699,0.8365769496204278,0.8190954773869347,our protocol approximation
+Published PSO-XGBoost 2025,0.9524,0.9481,0.963,Dhanka and Maini 2025
