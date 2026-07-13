@@ -1,0 +1,2 @@
+classifier__colsample_bytree,classifier__learning_rate,classifier__max_depth,classifier__min_child_weight,classifier__n_estimators,classifier__reg_alpha,classifier__reg_lambda,classifier__subsample,selector__k,selector__score_func
+0.8685239168468276,0.03660703172539426,6,6.228763541126306,147,0.2184404372168336,5.998119374444395,0.9591480906216039,157,<function main.<locals>.<lambda> at 0x0000022A709F7880>

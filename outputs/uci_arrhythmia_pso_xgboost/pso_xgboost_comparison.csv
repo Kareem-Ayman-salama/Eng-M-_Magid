@@ -1,0 +1,5 @@
+model,accuracy,balanced_accuracy,f1,roc_auc,source
+Current CatBoost Deep,0.8451327433628318,0.841407867494824,0.825,0.8943705018239181,our previous CV threshold result
+PSO-XGBoost,0.8097345132743363,0.8098787341023366,0.7962085308056872,0.8620920832100956,our new PSO experiment
+Published PSO-XGBoost 2025,0.9524,0.9481,0.963,,Dhanka and Maini 2025
+Published MBAR+SMOTE+CatBoost 2022,0.8633,,,,A.P. and David 2022
