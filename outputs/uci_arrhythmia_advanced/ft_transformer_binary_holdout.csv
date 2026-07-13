@@ -1,0 +1,2 @@
+task,model,epochs,best_valid_auc,accuracy,balanced_accuracy,precision,recall,f1,roc_auc,pr_auc
+Binary prediction holdout,Feature Tokenizer Transformer,56,0.8204545454545455,0.7912087912087912,0.7942176870748299,0.7446808510638298,0.8333333333333334,0.7865168539325843,0.7900874635568512,0.7108025216452207

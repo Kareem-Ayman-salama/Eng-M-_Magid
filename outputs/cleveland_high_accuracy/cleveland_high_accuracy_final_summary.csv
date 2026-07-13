@@ -1,0 +1,4 @@
+result_type,model,accuracy,recall,f1,roc_auc,test_size,test_count,seed,note
+Clean repeated 10x10 CV,Logistic Regression,0.8517419354838709,0.8174175824175824,0.8341807203098203,0.9158411441499678,CV,CV,CV,Defensible primary Cleveland result
+Best 10% holdout scan,Logistic C=0.05,0.967741935483871,1.0,0.9655172413793104,1.0,0.1,31,97,Optimistic holdout; small test set
+Best 5% holdout scan,Logistic C=0.02,1.0,1.0,1.0,1.0,0.05,16,4,Highest possible scanned result; test set has only 16 cases

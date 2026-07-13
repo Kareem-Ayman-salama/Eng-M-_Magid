@@ -1,0 +1,7 @@
+issue,project_response,evidence
+Using multiple datasets alone is not a sufficient contribution.,"Treat multiple datasets as validation evidence, not as the main novelty.","Kaggle, UCI, OpenML, feature-selection, and FT-Transformer results are reported separately."
+A clear technical contribution is required.,Propose a unified explainable hybrid framework.,Soft Voting and Stacking hybrids combine tuned boosting and tree-ensemble learners.
+The model should not be a black box.,Add SHAP explainability for the final tree-based model.,"SHAP identifies chest pain type, ST slope, oldpeak, cholesterol, max heart rate, and exercise angina."
+Deep learning should be represented if the thesis claims modern AI.,Add Feature Tokenizer Transformer for tabular clinical data.,FT-Transformer is evaluated as a deep tabular baseline and compared with boosting/hybrid models.
+"Feature engineering/selection should be evaluated, not assumed.",Add ANOVA and mutual-information SelectKBest experiments.,Feature selection is shown to reduce dimensionality but does not outperform the full hybrid framework.
+High published accuracies may come from different protocols.,Separate published results from reproducible notebook-generated results.,Published-work comparison table includes a comparison-type note for each row.

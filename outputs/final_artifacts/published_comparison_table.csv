@@ -1,0 +1,6 @@
+study,task,accuracy,notes
+Our work - CatBoost Deep,Binary normal vs arrhythmia,0.8451,5-fold OOF threshold optimization
+Chittoria et al. 2022,Binary normal vs arrhythmia,0.84,UCI Arrhythmia with ML and mRMR
+Anuradha and David 2022,Binary normal vs arrhythmia,0.8633,SMOTE + MBAR + CatBoost
+Our work - Grouped CatBoost,Grouped disease classification,0.7301,Rare classes grouped for reliability
+Chittoria et al. 2022,Multiclass arrhythmia classification,0.8148,Published multiclass benchmark
