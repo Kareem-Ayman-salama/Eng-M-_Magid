@@ -140,6 +140,15 @@ def build_notebook() -> nbf.NotebookNode:
 
             CONFIG = Config(
                 candidate_input_paths=(
+                    Path(
+                        "/kaggle/input/paraoxymal-atrial-fibrillation-prediction-database/"
+                        "paf-prediction-challenge-database-1.0.0/"
+                        "paf-prediction-challenge-database-1.0.0"
+                    ),
+                    Path(
+                        "/kaggle/input/paraoxymal-atrial-fibrillation-prediction-database/"
+                        "paf-prediction-challenge-database-1.0.0"
+                    ),
                     Path("/kaggle/input/paraoxymal-atrial-fibrillation-prediction-database"),
                     Path("/kaggle/input/paf-prediction-challenge-database"),
                     Path("/kaggle/input/afpdb"),
@@ -163,6 +172,7 @@ def build_notebook() -> nbf.NotebookNode:
 
             DATA_ROOT = locate_or_download_afpdb(CONFIG)
             print("Data root:", DATA_ROOT)
+            SEARCH_ROOTS = [DATA_ROOT, *DATA_ROOT.parents]
             """
         ),
         md("## 3. Record Discovery and True Prediction Labels"),
@@ -190,8 +200,18 @@ def build_notebook() -> nbf.NotebookNode:
                 return pd.DataFrame(rows)
 
 
+            def find_first_file(name_pattern: str) -> Path | None:
+                for root in SEARCH_ROOTS:
+                    if root.exists():
+                        matches = list(root.rglob(name_pattern))
+                        if matches:
+                            return matches[0]
+                return None
+
+
             def load_event2_answers(root: Path) -> dict[str, int]:
-                answer_files = list(root.rglob("event-2-answers*"))
+                answer_file = find_first_file("event-2-answers*")
+                answer_files = [answer_file] if answer_file is not None else []
                 if not answer_files:
                     return {}
                 tokens = answer_files[0].read_text(errors="ignore").split()
@@ -373,7 +393,46 @@ def build_notebook() -> nbf.NotebookNode:
             display(features.head())
             """
         ),
-        md("## 5. Models and Evaluation Helpers"),
+        md("## 5. Record-Level Aggregation for Pairwise Onset Prediction"),
+        code(
+            """
+            META_COLUMNS_WINDOW = {
+                "record", "subject_group", "split_source", "target", "window_minutes",
+                "window_index", "start_sample", "end_sample", "fs",
+            }
+            WINDOW_NUMERIC_FEATURES = [c for c in features.columns if c not in META_COLUMNS_WINDOW and pd.api.types.is_numeric_dtype(features[c])]
+
+
+            def build_record_features(window_features: pd.DataFrame) -> pd.DataFrame:
+                rows = []
+                group_columns = ["record", "subject_group", "split_source", "target", "window_minutes"]
+                for keys, group in window_features.groupby(group_columns):
+                    row = dict(zip(group_columns, keys))
+                    row["n_windows"] = len(group)
+                    for feature in WINDOW_NUMERIC_FEATURES:
+                        values = pd.to_numeric(group[feature], errors="coerce")
+                        row[f"{feature}_mean"] = float(values.mean())
+                        row[f"{feature}_std"] = float(values.std(ddof=0))
+                        row[f"{feature}_last"] = float(values.iloc[-1])
+                        row[f"{feature}_slope"] = float(np.polyfit(np.arange(len(values)), values.fillna(values.mean()), 1)[0]) if len(values) > 1 else 0.0
+                    rows.append(row)
+                return pd.DataFrame(rows)
+
+
+            record_features = build_record_features(features)
+            RECORD_META_COLUMNS = {"record", "subject_group", "split_source", "target", "window_minutes"}
+            RECORD_NUMERIC_FEATURES = [
+                c for c in record_features.columns
+                if c not in RECORD_META_COLUMNS and pd.api.types.is_numeric_dtype(record_features[c])
+            ]
+
+            print(record_features.shape)
+            print("record-level numeric features:", len(RECORD_NUMERIC_FEATURES))
+            display(record_features.groupby(["split_source", "window_minutes", "target"]).size().unstack(fill_value=0))
+            record_features.to_csv(OUTPUT_DIR / "afpdb_record_level_features.csv", index=False)
+            """
+        ),
+        md("## 6. Models and Evaluation Helpers"),
         code(
             """
             META_COLUMNS = {
@@ -442,7 +501,7 @@ def build_notebook() -> nbf.NotebookNode:
                 return list(StratifiedKFold(n_splits=3, shuffle=True, random_state=SEED).split(np.zeros(len(y)), y))
             """
         ),
-        md("## 6. Subject-Level Cross-Validation"),
+        md("## 7. Subject-Level Cross-Validation"),
         code(
             """
             def evaluate_cv(data: pd.DataFrame, source_filter: str = "learning") -> pd.DataFrame:
@@ -476,7 +535,80 @@ def build_notebook() -> nbf.NotebookNode:
             cv_results.to_csv(OUTPUT_DIR / "afpdb_subject_level_cv_results.csv", index=False)
             """
         ),
-        md("## 7. Challenge-Test Evaluation"),
+        md("## 8. Record-Level and Pairwise PAF Onset Evaluation"),
+        code(
+            """
+            def evaluate_record_level_cv(data: pd.DataFrame) -> pd.DataFrame:
+                rows = []
+                source_data = data[data["split_source"] == "learning"].copy()
+                for window_minutes in sorted(source_data["window_minutes"].unique()):
+                    working = source_data[source_data["window_minutes"] == window_minutes].copy()
+                    if working["target"].nunique() < 2:
+                        continue
+                    x_data = working[RECORD_NUMERIC_FEATURES]
+                    y_data = working["target"].astype(int)
+                    groups = working["subject_group"].astype(str)
+                    splits = group_cv_splits(y_data, groups)
+                    for name, model in build_models().items():
+                        fold_rows = []
+                        for train_idx, test_idx in splits:
+                            try:
+                                fitted = clone(model).fit(x_data.iloc[train_idx], y_data.iloc[train_idx])
+                                proba = fitted.predict_proba(x_data.iloc[test_idx])[:, 1] if hasattr(fitted, "predict_proba") else None
+                                pred = (proba >= 0.5).astype(int) if proba is not None else fitted.predict(x_data.iloc[test_idx])
+                                fold_rows.append(binary_metrics(y_data.iloc[test_idx], pred, proba))
+                            except Exception as exc:
+                                print(f"Skipped record-level {name} {window_minutes}m fold: {exc}")
+                        if fold_rows:
+                            rows.append({"window_minutes": window_minutes, "model": name, **pd.DataFrame(fold_rows).mean().to_dict()})
+                return pd.DataFrame(rows).sort_values(["balanced_accuracy", "f1", "roc_auc"], ascending=False) if rows else pd.DataFrame()
+
+
+            def evaluate_pairwise_paf_cv(data: pd.DataFrame) -> pd.DataFrame:
+                rows = []
+                paf_data = data[(data["split_source"] == "learning") & (data["record"].str.startswith("p"))].copy()
+                for window_minutes in sorted(paf_data["window_minutes"].unique()):
+                    working = paf_data[paf_data["window_minutes"] == window_minutes].copy()
+                    if working["target"].nunique() < 2:
+                        continue
+                    x_data = working[RECORD_NUMERIC_FEATURES]
+                    y_data = working["target"].astype(int)
+                    groups = working["subject_group"].astype(str)
+                    splits = group_cv_splits(y_data, groups)
+                    for name, model in build_models().items():
+                        pair_scores = []
+                        for train_idx, test_idx in splits:
+                            try:
+                                fitted = clone(model).fit(x_data.iloc[train_idx], y_data.iloc[train_idx])
+                                fold = working.iloc[test_idx].copy()
+                                fold["proba"] = fitted.predict_proba(x_data.iloc[test_idx])[:, 1] if hasattr(fitted, "predict_proba") else fitted.predict(x_data.iloc[test_idx])
+                                correct = 0
+                                total = 0
+                                for _, pair in fold.groupby("subject_group"):
+                                    if pair["target"].nunique() != 2:
+                                        continue
+                                    predicted_record = pair.sort_values("proba", ascending=False).iloc[0]["record"]
+                                    true_record = pair[pair["target"] == 1].iloc[0]["record"]
+                                    correct += int(predicted_record == true_record)
+                                    total += 1
+                                if total:
+                                    pair_scores.append(correct / total)
+                            except Exception as exc:
+                                print(f"Skipped pairwise {name} {window_minutes}m fold: {exc}")
+                        if pair_scores:
+                            rows.append({"window_minutes": window_minutes, "model": name, "pairwise_accuracy": float(np.mean(pair_scores)), "pairs": int(len(pair_scores))})
+                return pd.DataFrame(rows).sort_values(["pairwise_accuracy"], ascending=False) if rows else pd.DataFrame()
+
+
+            record_cv_results = evaluate_record_level_cv(record_features)
+            pairwise_results = evaluate_pairwise_paf_cv(record_features)
+            display(record_cv_results)
+            display(pairwise_results)
+            record_cv_results.to_csv(OUTPUT_DIR / "afpdb_record_level_cv_results.csv", index=False)
+            pairwise_results.to_csv(OUTPUT_DIR / "afpdb_pairwise_paf_onset_results.csv", index=False)
+            """
+        ),
+        md("## 9. Challenge-Test Evaluation"),
         code(
             """
             def evaluate_challenge_test(data: pd.DataFrame) -> pd.DataFrame:
@@ -508,18 +640,30 @@ def build_notebook() -> nbf.NotebookNode:
             challenge_results.to_csv(OUTPUT_DIR / "afpdb_challenge_test_results.csv", index=False)
             """
         ),
-        md("## 8. Final Holdout, Curves, and Feature Importance"),
+        md("## 10. Final Holdout, Curves, and Feature Importance"),
         code(
             """
             def final_holdout(data: pd.DataFrame) -> tuple[Any, pd.DataFrame]:
-                if cv_results.empty:
+                candidate_results = []
+                if not cv_results.empty:
+                    best_window = cv_results.iloc[0].copy()
+                    best_window["feature_level"] = "window"
+                    candidate_results.append(best_window)
+                if not record_cv_results.empty:
+                    best_record = record_cv_results.iloc[0].copy()
+                    best_record["feature_level"] = "record"
+                    candidate_results.append(best_record)
+                if not candidate_results:
                     raise ValueError("No CV results available.")
-                best = cv_results.iloc[0]
+                best = pd.DataFrame(candidate_results).sort_values(["balanced_accuracy", "f1", "roc_auc"], ascending=False).iloc[0]
                 best_window = int(best["window_minutes"])
                 best_name = str(best["model"])
+                feature_level = str(best["feature_level"])
                 models = build_models()
-                working = data[(data["split_source"] == "learning") & (data["window_minutes"] == best_window)].copy()
-                x_data = working[NUMERIC_FEATURES]
+                working_source = record_features if feature_level == "record" else data
+                feature_columns = RECORD_NUMERIC_FEATURES if feature_level == "record" else NUMERIC_FEATURES
+                working = working_source[(working_source["split_source"] == "learning") & (working_source["window_minutes"] == best_window)].copy()
+                x_data = working[feature_columns]
                 y_data = working["target"].astype(int)
                 groups = working["subject_group"].astype(str)
                 splitter = GroupShuffleSplit(n_splits=1, test_size=0.25, random_state=SEED)
@@ -528,7 +672,7 @@ def build_notebook() -> nbf.NotebookNode:
                 proba = model.predict_proba(x_data.iloc[test_idx])[:, 1] if hasattr(model, "predict_proba") else None
                 pred = (proba >= 0.5).astype(int) if proba is not None else model.predict(x_data.iloc[test_idx])
                 metrics = binary_metrics(y_data.iloc[test_idx], pred, proba)
-                metrics.update({"model": best_name, "window_minutes": best_window})
+                metrics.update({"model": best_name, "window_minutes": best_window, "feature_level": feature_level})
 
                 ConfusionMatrixDisplay.from_predictions(y_data.iloc[test_idx], pred, display_labels=["far/non-PAF", "pre-onset"])
                 plt.title(f"AFPDB Holdout Confusion Matrix - {best_name} ({best_window} min)")
@@ -553,7 +697,7 @@ def build_notebook() -> nbf.NotebookNode:
                 joblib.dump(fitted_full, OUTPUT_DIR / "best_afpdb_prediction_model.joblib")
                 classifier = fitted_full.named_steps.get("classifier") if hasattr(fitted_full, "named_steps") else fitted_full
                 if hasattr(classifier, "feature_importances_"):
-                    importance = pd.DataFrame({"feature": NUMERIC_FEATURES, "importance": classifier.feature_importances_}).sort_values("importance", ascending=False)
+                    importance = pd.DataFrame({"feature": feature_columns, "importance": classifier.feature_importances_}).sort_values("importance", ascending=False)
                     importance.to_csv(OUTPUT_DIR / "afpdb_feature_importance.csv", index=False)
                     plt.figure(figsize=(10, 6))
                     sns.barplot(data=importance.head(15), y="feature", x="importance")
@@ -569,7 +713,7 @@ def build_notebook() -> nbf.NotebookNode:
             holdout_metrics.to_csv(OUTPUT_DIR / "afpdb_holdout_metrics.csv", index=False)
             """
         ),
-        md("## 9. Visuals and Summary"),
+        md("## 11. Visuals and Summary"),
         code(
             """
             sns.set_theme(style="whitegrid")
@@ -597,6 +741,22 @@ def build_notebook() -> nbf.NotebookNode:
                 plt.savefig(OUTPUT_DIR / "afpdb_challenge_results_plot.png", dpi=180)
                 plt.show()
 
+            if not record_cv_results.empty:
+                plt.figure(figsize=(10, 5))
+                sns.barplot(data=record_cv_results.head(12), y="model", x="balanced_accuracy", hue="window_minutes")
+                plt.title("Top Record-Level CV Results")
+                plt.tight_layout()
+                plt.savefig(OUTPUT_DIR / "afpdb_record_level_results_plot.png", dpi=180)
+                plt.show()
+
+            if not pairwise_results.empty:
+                plt.figure(figsize=(10, 5))
+                sns.barplot(data=pairwise_results.head(12), y="model", x="pairwise_accuracy", hue="window_minutes")
+                plt.title("Top Pairwise PAF Onset Results")
+                plt.tight_layout()
+                plt.savefig(OUTPUT_DIR / "afpdb_pairwise_results_plot.png", dpi=180)
+                plt.show()
+
             summary = {
                 "rows": len(features),
                 "records": features["record"].nunique(),
@@ -608,6 +768,12 @@ def build_notebook() -> nbf.NotebookNode:
                 "best_cv_accuracy": None if cv_results.empty else float(cv_results.iloc[0]["accuracy"]),
                 "best_challenge_model": None if challenge_results.empty else challenge_results.iloc[0]["model"],
                 "best_challenge_balanced_accuracy": None if challenge_results.empty else float(challenge_results.iloc[0]["balanced_accuracy"]),
+                "best_record_level_model": None if record_cv_results.empty else record_cv_results.iloc[0]["model"],
+                "best_record_level_window_minutes": None if record_cv_results.empty else int(record_cv_results.iloc[0]["window_minutes"]),
+                "best_record_level_balanced_accuracy": None if record_cv_results.empty else float(record_cv_results.iloc[0]["balanced_accuracy"]),
+                "best_pairwise_model": None if pairwise_results.empty else pairwise_results.iloc[0]["model"],
+                "best_pairwise_window_minutes": None if pairwise_results.empty else int(pairwise_results.iloc[0]["window_minutes"]),
+                "best_pairwise_accuracy": None if pairwise_results.empty else float(pairwise_results.iloc[0]["pairwise_accuracy"]),
                 "holdout_accuracy": float(holdout_metrics.iloc[0]["accuracy"]),
                 "holdout_balanced_accuracy": float(holdout_metrics.iloc[0]["balanced_accuracy"]),
                 "holdout_roc_auc": float(holdout_metrics.iloc[0]["roc_auc"]),
@@ -618,7 +784,7 @@ def build_notebook() -> nbf.NotebookNode:
         ),
         md(
             """
-            ## 10. What This Adds to the Research
+            ## 12. What This Adds to the Research
 
             This notebook should be reported separately from AF detection:
 
@@ -632,6 +798,8 @@ def build_notebook() -> nbf.NotebookNode:
             Key outputs:
 
             - `afpdb_subject_level_cv_results.csv`
+            - `afpdb_record_level_cv_results.csv`
+            - `afpdb_pairwise_paf_onset_results.csv`
             - `afpdb_challenge_test_results.csv`
             - `afpdb_holdout_metrics.csv`
             - `afpdb_holdout_confusion_matrix.png`
