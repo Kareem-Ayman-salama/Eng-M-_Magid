@@ -17,3 +17,4 @@ python-bidi>=0.6
 faster-whisper>=1.2
 imbalanced-learn>=0.14
 streamlit>=1.59
+wfdb>=4.3

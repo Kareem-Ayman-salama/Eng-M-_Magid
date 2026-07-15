@@ -138,8 +138,19 @@ def build_notebook() -> nbf.NotebookNode:
                 random_state: int = SEED
 
 
+            PROJECT_ROOT = Path.cwd()
+            IS_KAGGLE = Path("/kaggle/input").exists()
+            LOCAL_DATA_ROOT = PROJECT_ROOT / "paraoxymal-atrial-fibrillation-prediction-database"
+
             CONFIG = Config(
                 candidate_input_paths=(
+                    LOCAL_DATA_ROOT
+                    / "paf-prediction-challenge-database-1.0.0"
+                    / "paf-prediction-challenge-database-1.0.0",
+                    LOCAL_DATA_ROOT / "paf-prediction-challenge-database-1.0.0",
+                    LOCAL_DATA_ROOT,
+                    PROJECT_ROOT / "data" / "afpdb",
+                    PROJECT_ROOT / "data" / "paf-prediction-challenge-database",
                     Path(
                         "/kaggle/input/paraoxymal-atrial-fibrillation-prediction-database/"
                         "paf-prediction-challenge-database-1.0.0/"
@@ -154,24 +165,28 @@ def build_notebook() -> nbf.NotebookNode:
                     Path("/kaggle/input/afpdb"),
                     Path("/kaggle/input/paf-prediction-challenge"),
                 ),
-                fallback_download_dir=Path("/kaggle/working/afpdb"),
-                output_dir=OUTPUT_DIR,
+                fallback_download_dir=(Path("/kaggle/working/afpdb") if IS_KAGGLE else PROJECT_ROOT / "data" / "afpdb"),
+                output_dir=(OUTPUT_DIR if IS_KAGGLE else PROJECT_ROOT / "outputs" / "afpdb_true_prediction"),
             )
+            OUTPUT_DIR = CONFIG.output_dir
+            OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
             def locate_or_download_afpdb(config: Config) -> Path:
                 for path in config.candidate_input_paths:
                     if path.exists() and any(path.rglob("*.hea")):
-                        print("Using Kaggle input:", path)
+                        print("Using input path:", path)
                         return path
-                print("Kaggle input was not found. Downloading AFPDB from PhysioNet into /kaggle/working ...")
+                print("Local/Kaggle input was not found. Downloading AFPDB from PhysioNet ...")
                 config.fallback_download_dir.mkdir(parents=True, exist_ok=True)
                 wfdb.dl_database("afpdb", dl_dir=str(config.fallback_download_dir))
                 return config.fallback_download_dir
 
 
             DATA_ROOT = locate_or_download_afpdb(CONFIG)
+            print("Running in Kaggle:", IS_KAGGLE)
             print("Data root:", DATA_ROOT)
+            print("Output dir:", OUTPUT_DIR)
             SEARCH_ROOTS = [DATA_ROOT, *DATA_ROOT.parents]
             """
         ),
